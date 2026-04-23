@@ -43,6 +43,10 @@ net.ipv4.tcp_slow_start_after_idle = 0
 # ── Path MTU discovery ON ─────────────────────────────────────────────────────
 net.ipv4.ip_no_pmtu_disc = 0
 
+# ── Disable TCP MTU probing (prevents kernel lowering MSS based on ICMP) ──────
+# Keeps MSS stable at 1460 even when upstream tunnel has lower MTU (e.g. 1238)
+net.ipv4.tcp_mtu_probing = 0
+
 # ── Reduce TIME_WAIT sockets (not fingerprint-related, just good practice) ────
 net.ipv4.tcp_fin_timeout = 15
 SYSCTL
@@ -75,18 +79,36 @@ ipt_add() {
     fi
 }
 
-# Clamp MSS to 1460 (1500 MTU - 20 IP header - 20 TCP header)
-ipt_add POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1460
-ipt_add FORWARD    -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1460
+# ── Clamp MSS = 1460 (1500 MTU - 20 IP - 20 TCP) on ALL chains ───────────────
+#
+# PREROUTING : rewrite MSS in SYN-ACK coming FROM upstream (may be 1198 due to
+#              their internal IPIP/GRE tunnel with MTU 1238) → hides IPIP/SIT
+#              interface type from passive fingerprinters like p0f/browserleaks
+# OUTPUT     : rewrite MSS in SYN we send to ANY destination (browserleaks etc)
+#              so we always advertise Ethernet-class MSS regardless of VPS tunnel
+# FORWARD    : for bridged/routed traffic
+# POSTROUTING: catch-all for anything not hit above
 
-info "iptables TCPMSS clamp (MSS=1460) applied."
+ipt_add PREROUTING  -p tcp --tcp-flags SYN,RST SYN     -j TCPMSS --set-mss 1460
+ipt_add PREROUTING  -p tcp --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 1460
+ipt_add OUTPUT      -p tcp --tcp-flags SYN,RST SYN     -j TCPMSS --set-mss 1460
+ipt_add FORWARD     -p tcp --tcp-flags SYN,RST SYN     -j TCPMSS --set-mss 1460
+ipt_add POSTROUTING -p tcp --tcp-flags SYN,RST SYN     -j TCPMSS --set-mss 1460
+
+info "iptables TCPMSS clamp (MSS=1460) applied on PREROUTING/OUTPUT/FORWARD/POSTROUTING."
 
 # Strip TCP timestamp option from outbound SYN/SYN-ACK packets.
 # Requires xt_TCPOPTSTRIP kernel module (available in most Ubuntu 22.04 kernels).
 if modprobe xt_TCPOPTSTRIP 2>/dev/null; then
-    ipt_add POSTROUTING -p tcp --syn          -j TCPOPTSTRIP --strip-options timestamp
-    ipt_add POSTROUTING -p tcp --tcp-flags SYN,ACK SYN,ACK -j TCPOPTSTRIP --strip-options timestamp
-    info "TCP timestamp option stripped from outbound SYN/SYN-ACK via iptables."
+    # Strip timestamps from outbound packets (OUTPUT = locally initiated)
+    ipt_add OUTPUT      -p tcp --syn                         -j TCPOPTSTRIP --strip-options timestamp
+    ipt_add OUTPUT      -p tcp --tcp-flags SYN,ACK SYN,ACK  -j TCPOPTSTRIP --strip-options timestamp
+    # Strip timestamps from upstream SYN-ACK before kernel processes them (PREROUTING)
+    ipt_add PREROUTING  -p tcp --tcp-flags SYN,ACK SYN,ACK  -j TCPOPTSTRIP --strip-options timestamp
+    # Strip timestamps on forwarded/NATted traffic
+    ipt_add POSTROUTING -p tcp --syn                         -j TCPOPTSTRIP --strip-options timestamp
+    ipt_add POSTROUTING -p tcp --tcp-flags SYN,ACK SYN,ACK  -j TCPOPTSTRIP --strip-options timestamp
+    info "TCP timestamp option stripped on PREROUTING/OUTPUT/POSTROUTING."
 else
     warn "xt_TCPOPTSTRIP not available – timestamps already disabled via sysctl (net.ipv4.tcp_timestamps=0)."
 fi
